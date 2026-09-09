@@ -1,0 +1,22 @@
+# ---- ข้อมูล / ผลลัพธ์ (ไม่เก็บลง git เพราะเป็นข้อมูลลูกค้าจริง) ----
+output/
+*.xls
+*.xlsx
+*.xlsm
+*.csv
+*.pdf
+~$*
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# ---- OS / editor ----
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
