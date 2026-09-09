@@ -52,6 +52,24 @@ import pandas as pd
 YARD_CODE_COL = "Pickup"        # รหัสลาน เช่น BKK27, LCHY5
 YARD_NAME_COL = "Pickup Name"   # ชื่อลาน เช่น B.C. DEPOT CO.,LTD.
 
+# รวมลานเหล่านี้เข้าเป็นกลุ่มเดียว (ออกไฟล์เดียว + แถวเดียวในไฟล์สรุปรวม)
+# {รหัส Pickup เดิม (ตัวพิมพ์ใหญ่): (รหัสที่ใช้แสดง, ชื่อลานที่ใช้แสดง)}
+# หมายเหตุ: คอลัมน์ Pickup / Pickup Name ในแต่ละแถวยังคงค่าเดิมไว้ (ไม่ถูกเขียนทับ)
+YARD_MERGE = {
+    "BKK01": ("BKK01+04", "PAT TERMINAL 1&2 (PORT AUTHORITY OF THAILAND)"),
+    "BKK04": ("BKK01+04", "PAT TERMINAL 1&2 (PORT AUTHORITY OF THAILAND)"),
+}
+
+# ถ้าช่องเหล่านี้ "ว่างจริง" (None / NaN / ช่องว่างล้วน) ให้เติมข้อความนี้อัตโนมัติ
+# — ไม่แตะช่องที่มีข้อความอยู่แล้ว
+FILL_WHEN_BLANK = {
+    "TRAFFIC ORDER": "GOOD AND CLEAN CONTAINER",
+}
+
+# คอลัมน์ COMMON REMARK จะถูกตัดออกจากไฟล์ต่อลาน
+# ยกเว้นลาน (รหัส Pickup เดิม) เหล่านี้ ให้คงคอลัมน์ไว้ — ตำแหน่งอยู่หลัง TRAFFIC ORDER
+COMMON_REMARK_KEEP = {"BKK01", "BKK02", "BKK04", "LCH55"}
+
 # ลำดับคอลัมน์ที่อยากให้แสดงในไฟล์ผลลัพธ์ (คอลัมน์อื่นที่ไม่อยู่ในนี้จะต่อท้ายให้เอง)
 PREFERRED_ORDER = [
     "BK No", "ETD", "VSL", "VOY", "POR", "LOD", "DIS", "TPSZ",
@@ -162,6 +180,15 @@ def read_pickup_table(path: Path) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+def _is_blank(x) -> bool:
+    """True เมื่อค่าว่างจริง: None / NaN / ช่องว่างล้วน"""
+    if x is None:
+        return True
+    if isinstance(x, float) and pd.isna(x):
+        return True
+    return isinstance(x, str) and x.strip() == ""
+
+
 def clean_frame(df: pd.DataFrame) -> pd.DataFrame:
     """จัดรูปแบบค่าต่าง ๆ ให้อ่านง่าย"""
     df = df.copy()
@@ -170,6 +197,18 @@ def clean_frame(df: pd.DataFrame) -> pd.DataFrame:
     for col in df.columns:
         if df[col].dtype == object:
             df[col] = df[col].map(lambda x: x.strip() if isinstance(x, str) else x)
+
+    # เติมค่าให้ช่องที่ "ว่างจริง" เท่านั้น (ไม่แตะช่องที่มีข้อความอยู่แล้ว)
+    for col, value in FILL_WHEN_BLANK.items():
+        if col in df.columns:
+            df[col] = df[col].map(lambda x: value if _is_blank(x) else x)
+
+    # ORG CUST ว่าง -> เติมจาก DOC CUST (แถวเดียวกัน) แล้วตัด DOC CUST ทิ้ง
+    if "ORG CUST" in df.columns and "DOC CUST" in df.columns:
+        blank = df["ORG CUST"].map(_is_blank)
+        df.loc[blank, "ORG CUST"] = df.loc[blank, "DOC CUST"]
+    if "DOC CUST" in df.columns:
+        df = df.drop(columns=["DOC CUST"])
 
     if "ETD" in df.columns:
         df["ETD"] = df["ETD"].map(fmt_etd)
@@ -191,30 +230,76 @@ def order_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df[front + rest]
 
 
+def yard_group_keys(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    """คืน (รหัสลาน, ชื่อลาน) สำหรับใช้ 'จัดกลุ่ม' โดยรวมลานตาม YARD_MERGE แล้ว
+    (ใช้ร่วมกันทั้งไฟล์สรุปรวมและการแยกไฟล์ต่อลาน เพื่อให้ผลตรงกัน)"""
+    raw_code = (df.get(YARD_CODE_COL, pd.Series(["NA"] * len(df), index=df.index))
+                  .fillna("NA").astype(str).str.strip().replace("", "NA"))
+    raw_name = (df.get(YARD_NAME_COL, pd.Series([""] * len(df), index=df.index))
+                  .fillna("").astype(str).str.strip())
+
+    gcode, gname = [], []
+    for code, name in zip(raw_code, raw_name):
+        merged = YARD_MERGE.get(code.upper())
+        if merged:
+            gcode.append(merged[0])
+            gname.append(merged[1])
+        else:
+            gcode.append(code)
+            gname.append(name)
+    return pd.Series(gcode, index=df.index), pd.Series(gname, index=df.index)
+
+
 # ----------------------------------------------------------------------
 # เขียน Excel (จัดรูปแบบให้อ่านง่าย)
 # ----------------------------------------------------------------------
+
+# --- ตั้งค่ารูปแบบ (ใช้ร่วมกันทุกไฟล์/ทุกชีต) ---
+FONT_NAME = "Calibri"
+FONT_SIZE = 11
+ROW_HEIGHT = 13
+
+# ไฮไลท์ทั้งแถวตามค่าในคอลัมน์ TPSZ
+TPSZ_YELLOW = ("20RF", "R40H")                       # ตู้ห้องเย็น
+TPSZ_GREEN = ("20OT", "20FR", "40OT", "40FR")        # ตู้ open-top / flat-rack
+# คำใน TRAFFIC ORDER ที่ทำให้ตัวอักษรเป็นสีแดงตัวหนา
+PRECOOL_RE = re.compile(r"pre[-\s]?cool", re.IGNORECASE)
+
 
 def _style_sheet(ws, df: pd.DataFrame, wrap_cols: list[str]) -> None:
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
 
     header_fill = PatternFill("solid", fgColor="1F4E78")
-    header_font = Font(bold=True, color="FFFFFF")
+    header_font = Font(name=FONT_NAME, size=FONT_SIZE, bold=True, color="FFFFFF")
+    base_font = Font(name=FONT_NAME, size=FONT_SIZE)
+    total_font = Font(name=FONT_NAME, size=FONT_SIZE, bold=True)
+    precool_font = Font(name=FONT_NAME, size=FONT_SIZE, bold=True, color="FF0000")
 
-    for ci, col in enumerate(df.columns, start=1):
+    yellow_fill = PatternFill("solid", fgColor="FFFF00")
+    green_fill = PatternFill("solid", fgColor="92D050")
+
+    cols = list(df.columns)
+    ncol = len(cols)
+    col_i = {c: i + 1 for i, c in enumerate(cols)}      # ชื่อคอลัมน์ -> เลขคอลัมน์ (1-based)
+    tpsz_i = col_i.get("TPSZ")
+    traffic_i = col_i.get("TRAFFIC ORDER")
+
+    # ---- หัวตาราง ----
+    for ci in range(1, ncol + 1):
         cell = ws.cell(row=1, column=ci)
         cell.fill = header_fill
         cell.font = header_font
         cell.alignment = Alignment(vertical="center", wrap_text=True)
 
-    ws.row_dimensions[1].height = 28
     ws.freeze_panes = "A2"
     if ws.max_row >= 1 and ws.max_column >= 1:
         ws.auto_filter.ref = ws.dimensions
 
-    wrap_set = {c for c in wrap_cols if c in df.columns}
-    for ci, col in enumerate(df.columns, start=1):
+    # ---- ความกว้างคอลัมน์ ----
+    wrap_set = {c for c in wrap_cols if c in cols}
+    wrap_idx = {col_i[c] for c in wrap_set}
+    for ci, col in enumerate(cols, start=1):
         letter = get_column_letter(ci)
         if col in wrap_set:
             ws.column_dimensions[letter].width = 46
@@ -223,12 +308,38 @@ def _style_sheet(ws, df: pd.DataFrame, wrap_cols: list[str]) -> None:
             width = max([len(str(col))] + [len(s) for s in sample]) + 2
             ws.column_dimensions[letter].width = min(max(width, 10), 34)
 
-    if wrap_set:
-        wrap_idx = {df.columns.get_loc(c) + 1 for c in wrap_set}
-        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
-            for cell in row:
-                if cell.column in wrap_idx:
-                    cell.alignment = Alignment(wrap_text=True, vertical="top")
+    # ---- แถวข้อมูล : ฟอนต์ / ไฮไลท์ / จัดข้อความ ----
+    for ri in range(2, ws.max_row + 1):
+        rec = df.iloc[ri - 2]
+        is_total = str(rec.iloc[0]).strip() == "รวมทั้งหมด"
+
+        row_fill = None
+        if tpsz_i is not None:
+            tp = str(rec.iloc[tpsz_i - 1]).upper().replace(" ", "")
+            if any(k in tp for k in TPSZ_YELLOW):
+                row_fill = yellow_fill
+            elif any(k in tp for k in TPSZ_GREEN):
+                row_fill = green_fill
+
+        is_precool = (
+            traffic_i is not None
+            and bool(PRECOOL_RE.search(str(rec.iloc[traffic_i - 1])))
+        )
+
+        for ci in range(1, ncol + 1):
+            cell = ws.cell(row=ri, column=ci)
+            cell.font = total_font if is_total else base_font
+            if row_fill is not None:
+                cell.fill = row_fill
+            if ci in wrap_idx:
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+        if is_precool:
+            ws.cell(row=ri, column=traffic_i).font = precool_font
+
+    # ---- ความสูงทุกแถว (รวมหัวตาราง) = ROW_HEIGHT ----
+    for ri in range(1, ws.max_row + 1):
+        ws.row_dimensions[ri].height = ROW_HEIGHT
 
 
 def build_customer_summary(df: pd.DataFrame) -> pd.DataFrame:
@@ -258,6 +369,16 @@ def build_customer_summary(df: pd.DataFrame) -> pd.DataFrame:
 
 def write_yard_file(out_path: Path, df_yard: pd.DataFrame) -> None:
     df_list = order_columns(clean_frame(df_yard))
+
+    # ตัด COMMON REMARK ออก ยกเว้นลานใน COMMON_REMARK_KEEP (คงไว้หลัง TRAFFIC ORDER)
+    if "COMMON REMARK" in df_list.columns:
+        codes = set(
+            df_yard.get(YARD_CODE_COL, pd.Series(dtype="object"))
+                   .dropna().astype(str).str.strip().str.upper()
+        )
+        if not (codes & COMMON_REMARK_KEEP):
+            df_list = df_list.drop(columns=["COMMON REMARK"])
+
     df_sum = build_customer_summary(df_list)
 
     with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
@@ -271,9 +392,8 @@ def write_yard_file(out_path: Path, df_yard: pd.DataFrame) -> None:
 def write_overview_file(out_path: Path, df_all: pd.DataFrame) -> pd.DataFrame:
     """สร้างไฟล์สรุปรวม: แต่ละลานมีกี่งาน / กี่ตู้"""
     df = clean_frame(df_all)
-    code = df.get(YARD_CODE_COL, pd.Series(["(ไม่ระบุ)"] * len(df))).fillna("(ไม่ระบุ)").replace("", "(ไม่ระบุ)")
-    name = df.get(YARD_NAME_COL, pd.Series([""] * len(df))).fillna("").astype(str)
-    df = df.assign(_code=code, _name=name)
+    gcode, gname = yard_group_keys(df)
+    df = df.assign(_code=gcode, _name=gname)
 
     qty_cols = [c for c in QTY_COLS if c in df.columns]
     rows = []
@@ -355,11 +475,10 @@ def process_excel_file(path: Path, out_dir: Path) -> None:
     overview = write_overview_file(overview_path, df)
     print(f"  + {overview_path.name}")
 
-    # แยกไฟล์ตามลาน
-    code_series = df.get(YARD_CODE_COL, pd.Series(["NA"] * len(df))).fillna("NA").astype(str).str.strip().replace("", "NA")
-    name_series = df.get(YARD_NAME_COL, pd.Series([""] * len(df))).fillna("").astype(str).str.strip()
+    # แยกไฟล์ตามลาน (รวมลานตาม YARD_MERGE)
+    gcode, gname = yard_group_keys(df)
 
-    for code, g in df.assign(_code=code_series, _name=name_series).groupby("_code"):
+    for code, g in df.assign(_code=gcode, _name=gname).groupby("_code"):
         yard_name = g["_name"].mode().iat[0] if not g["_name"].mode().empty else ""
         label = sanitize_filename(f"{code}_{yard_name}" if yard_name else code)
         yard_path = out_dir / f"{stem}__{label}.xlsx"
